@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'dart:convert';
+import 'dart:async';
 import 'services/mqtt_service.dart';
 
 const String DATABASE_URL = 'https://ac119-smart-iot-controll-ef7e3-default-rtdb.firebaseio.com';
@@ -35,7 +36,11 @@ class _MotorScreenState extends State<MotorScreen> {
   final mqtt = MQTTService();
   bool isMqttReady = false;
   bool isConnected = false;
-  int _refreshKey = 0;
+  late Timer _pollingTimer;
+  Map<String, dynamic>? _devicesData;
+  bool _isLoading = true;
+  String? _error;
+  final List<_Notification> _notifications = [];
 
   @override
   void initState() {
@@ -48,6 +53,115 @@ class _MotorScreenState extends State<MotorScreen> {
       });
     };
     mqtt.connect();
+
+    // Initial data fetch
+    _initialFetch();
+
+    // Start polling for data changes every 2 seconds
+    _pollingTimer = Timer.periodic(const Duration(seconds: 2), (timer) {
+      _pollForChanges();
+    });
+  }
+
+  @override
+  void dispose() {
+    _pollingTimer.cancel();
+    super.dispose();
+  }
+
+  Future<void> _initialFetch() async {
+    int retries = 3;
+    while (retries > 0) {
+      try {
+        final data = await fetchDevices();
+        if (mounted) {
+          setState(() {
+            _devicesData = data;
+            _isLoading = false;
+            _error = null;
+          });
+          _showNotification('Devices loaded successfully', Colors.green);
+        }
+        return;
+      } catch (e) {
+        retries--;
+        if (retries > 0) {
+          _showNotification('Retrying... (${retries} attempts left)', Colors.orange);
+          await Future.delayed(const Duration(seconds: 2));
+        } else {
+          if (mounted) {
+            setState(() {
+              _error = e.toString();
+              _isLoading = false;
+            });
+            _showNotification('Error: $e', Colors.red);
+          }
+        }
+      }
+    }
+  }
+
+  Future<void> _pollForChanges() async {
+    try {
+      final response = await http.get(
+        Uri.parse('$DATABASE_URL/.json'),
+      ).timeout(const Duration(seconds: 20));
+
+      if (response.statusCode == 200) {
+        final newData = jsonDecode(response.body) as Map<String, dynamic>;
+        
+        // Update only if data changed
+        if (_devicesData == null || jsonEncode(_devicesData) != jsonEncode(newData)) {
+          if (mounted) {
+            // Detect which device changed and show notification
+            _detectChangesAndNotify(newData);
+            
+            setState(() {
+              _devicesData = newData;
+              _error = null;
+            });
+          }
+        }
+      }
+    } catch (e) {
+      print('Polling error: $e');
+    }
+  }
+
+  void _detectChangesAndNotify(Map<String, dynamic> newData) {
+    if (_devicesData == null) return;
+    
+    newData.forEach((deviceId, newDeviceData) {
+      final oldDeviceData = _devicesData![deviceId];
+      if (oldDeviceData is Map && newDeviceData is Map) {
+        final oldMCFB = oldDeviceData['MOTORCONTROL']?['MCFB'];
+        final newMCFB = newDeviceData['MOTORCONTROL']?['MCFB'];
+        
+        if (oldMCFB != newMCFB) {
+          final status = newMCFB?.toString() ?? 'Unknown';
+          final statusText = status == 'ON' ? 'Started' : 'Stopped';
+          _showNotification('$deviceId: Motor $statusText', status == 'ON' ? Colors.green : Colors.red);
+        }
+      }
+    });
+  }
+
+  void _showNotification(String message, Color backgroundColor) {
+    final notification = _Notification(
+      id: DateTime.now().millisecondsSinceEpoch,
+      message: message,
+      backgroundColor: backgroundColor,
+    );
+
+    setState(() {
+      _notifications.add(notification);
+    });
+  }
+
+  void _removeNotification(int notificationId) {
+    setState(() {
+      _notifications.removeWhere((n) => n.id == notificationId);
+    });
   }
 
   void connectMQTT() async {
@@ -59,14 +173,17 @@ class _MotorScreenState extends State<MotorScreen> {
     try {
       final response = await http.get(
         Uri.parse('$DATABASE_URL/.json'),
-      ).timeout(const Duration(seconds: 10));
+      ).timeout(const Duration(seconds: 30));
 
       if (response.statusCode == 200) {
         final data = jsonDecode(response.body) as Map<String, dynamic>;
         return data;
       } else {
-        throw Exception('Failed to load devices: ${response.statusCode}');
+        throw Exception('Failed to load devices: HTTP ${response.statusCode}');
       }
+    } on TimeoutException catch (e) {
+      print('Error fetching devices: Network timeout');
+      throw Exception('Network timeout - Check your internet connection');
     } catch (e) {
       print('Error fetching devices: $e');
       throw Exception('Error: $e');
@@ -75,12 +192,14 @@ class _MotorScreenState extends State<MotorScreen> {
 
   void startMotor(String deviceId) {
     print("START BUTTON CLICKED for $deviceId");
+    _showNotification('Starting $deviceId...', Colors.orange);
     updateMotorStatus(deviceId, 'ON');
     mqtt.publish("ON");
   }
 
   void stopMotor(String deviceId) {
     print("STOP BUTTON CLICKED for $deviceId");
+    _showNotification('Stopping $deviceId...', Colors.orange);
     updateMotorStatus(deviceId, 'OFF');
     mqtt.publish("OFF");
   }
@@ -95,11 +214,17 @@ class _MotorScreenState extends State<MotorScreen> {
 
       if (response.statusCode == 200) {
         print('Motor status updated successfully to $status');
+        _showNotification('$deviceId: Command sent ($status)', Colors.blue);
+        // Refresh data immediately after update
+        await Future.delayed(const Duration(milliseconds: 300));
+        _pollForChanges();
       } else {
         print('Error updating motor: ${response.statusCode}');
+        _showNotification('Error: Failed to update $deviceId', Colors.red);
       }
     } catch (e) {
       print('Error updating motor status: $e');
+      _showNotification('Error: $e', Colors.red);
     }
   }
 
@@ -110,25 +235,70 @@ class _MotorScreenState extends State<MotorScreen> {
         title: const Text("Motor Control System"),
         centerTitle: true,
       ),
-      body: FutureBuilder<Map<String, dynamic>>(
-        key: ValueKey<int>(_refreshKey),
-        future: fetchDevices(),
-        builder: (context, snapshot) {
-          if (snapshot.hasError) {
-            return Center(child: Text('Error: ${snapshot.error}'));
-          } else if (snapshot.connectionState == ConnectionState.waiting) {
-            return const Center(child: CircularProgressIndicator());
-          } else if (!snapshot.hasData || snapshot.data!.isEmpty) {
-            return const Center(child: Text('No devices found'));
-          } else {
-            return buildDevicesList(snapshot.data!);
-          }
-        },
+      body: Stack(
+        children: [
+          _isLoading
+              ? const Center(child: CircularProgressIndicator())
+              : _error != null
+                  ? Center(child: Text('Error: $_error'))
+                  : _devicesData == null || _devicesData!.isEmpty
+                      ? const Center(child: Text('No devices found'))
+                      : buildDevicesList(_devicesData!),
+          // Notifications Stack
+          Positioned(
+            bottom: 100,
+            left: 10,
+            right: 10,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: _notifications.map((notification) {
+                return Padding(
+                  padding: const EdgeInsets.only(top: 8.0),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                    decoration: BoxDecoration(
+                      color: notification.backgroundColor,
+                      borderRadius: BorderRadius.circular(8),
+                      boxShadow: [
+                        BoxShadow(
+                          color: Colors.black.withOpacity(0.3),
+                          blurRadius: 8,
+                          offset: const Offset(0, 2),
+                        ),
+                      ],
+                    ),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            notification.message,
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontWeight: FontWeight.bold,
+                              fontSize: 14,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        GestureDetector(
+                          onTap: () => _removeNotification(notification.id),
+                          child: const Icon(
+                            Icons.close,
+                            color: Colors.white,
+                            size: 20,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                );
+              }).toList(),
+            ),
+          ),
+        ],
       ),
       floatingActionButton: FloatingActionButton(
-        onPressed: () => setState(() {
-          _refreshKey++;
-        }),
+        onPressed: _initialFetch,
         tooltip: 'Refresh',
         child: const Icon(Icons.refresh),
       ),
@@ -282,4 +452,16 @@ class DeviceCard extends StatelessWidget {
       ),
     );
   }
+}
+
+class _Notification {
+  final int id;
+  final String message;
+  final Color backgroundColor;
+
+  _Notification({
+    required this.id,
+    required this.message,
+    required this.backgroundColor,
+  });
 }
